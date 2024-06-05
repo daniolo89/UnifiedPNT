@@ -1,0 +1,242 @@
+clc
+clear all;
+close all;
+addpath("Functions\")
+
+%% Define configuration parameters
+c              = 3e8 ;                      % Speed of light (m/s)
+f              = 30e9;                      % Carrier frequency (GHz)
+lambda         = c / f;                     % Wavelength (m)
+TxPower_dBm    = 20;                        % transmit power in dBm 
+TxPower        = (10^(TxPower_dBm/10))*1e-3; % transmit power in watt
+NPSD           = 1e-3*10^(-174/10)*1e9;     % noise spectral density, NPSD = kT
+Noise_Factor   = 10^(8/10);                 % noise factor
+NoiseSampleNum = 1000;                      % Number of noise iterations
+PointNum       = 30;                        % Number of points UE to generate
+
+%% Geometry
+Mr             = 64;                                                          % Number of RIS elements in a row
+Mc             = 64;                                                          % Number of RIS elements in a column
+risElementDist = 0.5 * lambda;                                                % RIS element distance
+r_vec          = 10.^(linspace(0, log10(35), PointNum));                      % The vector r_vec contains the radial distances of the points from the origin, a logarithmically spaced vector ranging from 1 to 35. 
+xyz            = [-r_vec/sqrt(2); r_vec/sqrt(2); -10*ones(1, length(r_vec))]; % XYZ coordinates of the UE points
+uePos_prim     = [xyz(1,:).', xyz(2,:).', xyz(3,:).'];                        % UE positions
+uePos          = uePos_prim(1,:);
+bsPos          = [5, 5, 0];                                                   % Base station position
+risPos         = [0, 0, 0];                                                   % RIS position
+
+%% OFDM generation 
+% Parameter definition
+Nfft        = 4096;                                       % FFT Size
+N_ftt_tilde = 2^8;                                        % IFFT length for angle estimation
+Df          = 120e3;                                      % Subcarrier bandwidth (GHz)
+Nsc         = 3e3;                                        % Number of subcarriers
+Ts          = 1/Df;                                       % Symbol duration
+Ncp         = 288;                                        % length in samples of CP
+Nsym        = 256;                                        % # of ofdm symbols
+FreqOffset  = 0;                                          % in Hz
+sqEs        = sqrt(TxPower / Nsc);                        % Square root of symbol energy
+sqN         = sqrt(Noise_Factor * NPSD * Df / 2);         % Square root of noise power (P_N = k T B F, where k is Boltzmann's constant, T is the standard temperature in Kelvin, B is the bandwidth, F is the noise figure. 
+snr         = TxPower / (Nsc * Noise_Factor * NPSD * Df); % SNR in linear scale
+Dt          = 0; %rand*(1/Df);                            % Random time delay, uniformly drawn from the interval [0, 1/∆f ). 
+Delta_t     = 1/(Nfft * Df);
+
+%% Compute the phase profile matrix
+% Generate random phase shifts for RIS elements over time
+% Each element of the matrix represents a random value uniformly distributed between 0 and 1. 
+% Each column represents a different time instance.
+% The phase angles are expressed as complex values on the unit circle.
+b_k        = rand(Nsym/2, Mr*Mc);
+
+gamma_2k   = b_k;
+gamma_2k_1 = -b_k;
+
+ris_phases = [gamma_2k;gamma_2k_1];
+
+% Calculate distances
+BsUeDist  = sqrt(sum((bsPos - uePos).^2, 2)); % Distance from BS to UE
+BsRisDist = sqrt(sum((bsPos - risPos).^2, 2)); % Distance from BS to RIS
+RisUeDist = sqrt(sum((risPos - uePos).^2, 2)); % Distance from RIS to UE
+
+% LoS path delay
+tau_b = (BsUeDist/c) + Dt;
+
+% Reflected path delay
+tau_r = (RisUeDist+BsRisDist)/c + Dt;
+
+% Compute azimuth angle (angle in x-y plane)
+az_theta = (atan2((bsPos(2) - risPos(2)), (bsPos(1) - risPos(1))));
+az_phi   = (atan2((risPos(2) - uePos(2)), (risPos(1) - uePos(1))));
+
+% Compute elevation angle (angle from x-y plane to direction vector)
+el_theta = acos((bsPos(3) - risPos(3))/BsRisDist); 
+el_phi   = acos((risPos(3) - uePos(3))/RisUeDist); 
+
+% Calculate wavenumber vector
+k_theta = cal_Kv(sin(el_theta), cos(az_theta), sin(az_theta), cos(el_theta), lambda);
+k_phi = cal_Kv(sin(el_phi), cos(az_phi), sin(az_phi), cos(el_phi), lambda);
+risElementLoc = computeRISPositions(Mr, Mc, risElementDist);
+
+% Calculate ur (steering vector) for the reflected path
+beta = @(k,M) k*(M-1)*(risElementDist/2);
+a = @(k,beta,M) exp(1j*beta)*exp(-1j*k*risElementDist*(0:M-1).');
+
+a_theta = kron(a(k_theta(1),beta(k_theta(1),Mr),Mr), a(k_theta(3),beta(k_theta(3),Mc),Mc));
+a_phi   = kron(a(k_phi(1),beta(k_phi(1),Mr),Mr), a(k_theta(3),beta(k_phi(3),Mc),Mc));
+
+
+ur = ris_phases*a_theta* a_phi.';
+
+%% Compute channel gains (gb, gr) based on Friis' formula (using unit directivity for BS, UE and RIS elements). 
+% Their phases are set randomly between [0,2π)
+% Friis' transmission formula for the channel gain is: g=sqrt((λ/(4πd))2^)
+
+% LOS gain calculation
+% gb = sqEs*sqrt((lambda)./ (4 * pi * BsUeDist)) .* exp(2 * pi * 1j * rand(size(BsUeDist)));
+% Compute the amplitude
+g_b_amplitude = sqrt((lambda / (4 * pi * BsUeDist))^2);  
+% Set random phases
+g_b_phase = 2 * pi * rand(size(BsUeDist));  % Random phase in [0, 2*pi)
+% Combine amplitude and phase to get the complex channel
+% gains
+gb = g_b_amplitude * exp(1j * g_b_phase); 
+
+% Reflected path gain calculation
+% n_ris = [0, 1, 0]; % RIS normal vector
+% % Compute the dot products
+% dot_k_theta = dot(n_ris, k_theta);
+% dot_k_phi   = dot(n_ris, k_phi);
+% % Compute the magnitudes of the vectors
+% norm_n_ris   = norm(n_ris);
+% norm_k_theta = norm(k_theta);
+% norm_k_phi   = norm(k_phi);
+% % Compute the angles 
+% angle_k_theta = acos(dot_k_theta / (norm_n_ris * norm_k_theta));
+% angle_k_phi   = acos(dot_k_phi / (norm_n_ris * norm_k_phi));
+% 
+% gr = ((lambda^2*(cos(angle_k_theta)^0.285)*(cos(angle_k_phi)^0.285)*sqEs) ./ (16 * pi * BsRisDist * RisUeDist)) .* exp(2 * pi * 1j * rand(size(BsUeDist)));
+
+% Compute the amplitude
+g_r_amplitude = sqrt((lambda / (4 * pi * BsRisDist))^2 * (lambda / (4 * pi * RisUeDist))^2);  % Reflected path gain amplitude
+% Set random phases
+g_r_phase = 2 * pi * rand(size(BsUeDist));  % Random phase in [0, 2*pi)
+% Combine amplitude and phase to get the complex channel gains
+gr = g_r_amplitude * exp(1j * g_r_phase);  
+
+
+% Frequency offset terms
+db = exp(-1j * 2 * pi * Df * tau_b  * (0:Nsc-1));
+dr = exp(-1j * 2 * pi * Df * tau_r  * (0:Nsc-1));
+
+% Received signal without noise
+Y_b = gb * sqEs * db.' * ones(1, Nsym) ;
+Y_r = gr * sqEs * ((dr.' * ones(1, Nsym)) .* (ones(1,Mr*Mc) * ur.'));
+Y_NL = Y_b+Y_r;
+
+% Received signal with noise
+Y = Y_NL + sqN * (randn(size(Y_NL)) + 1j * randn(size(Y_NL)));
+
+%% Estimation of tau_b
+yc = sum(Y, 2);
+
+% Calculate the IFFT matrix F
+F = exp(2j*pi*(0:Nfft-1)' * (0:Nsc-1) / Nfft) / Nfft;
+
+% Calculate the IFFT of yc
+y_c_bar = F * yc;
+
+% Find the index k that maximizes the absolute value
+[~, k_tilde] = max(abs(y_c_bar));
+
+% Define the function to add artificial delay δ
+yc_delayed = @(delta) yc .* exp(-1j*2*pi*Df*delta*(0:length(yc)-1)).';
+
+% Optimization options for the quasi-Newton method
+options = optimoptions('fminunc', 'Display', 'off', 'OptimalityTolerance', 1e-10);
+
+% Function to be minimized
+objective_function = @(delta) -abs(F(k_tilde, :) * yc_delayed(delta));
+
+% Perform the optimization over δ in the range [0, Delta_t]
+delta_tilde = fminunc(objective_function, 0, options);
+
+% Estimate tau_b
+tau_b_est = (k_tilde - 1) * Delta_t - delta_tilde;
+
+
+%% Estimate of tau_r
+% Calculate the BS contribution d_hat
+d_hat = exp(-1j * 2 * pi * Df * tau_b_est * (0:length(Y)-1)).';
+
+% Compute gb_hat
+gb_hat = sum(Y .* conj(d_hat)) / (Nsc * Nsym);
+
+% Remove the BS contribution from the received signal Y
+Yr = Y - (gb_hat.' * ones(1, Nsc)).' .* (d_hat * ones(1,Nsym)) ;
+
+% Perform the IFFT of Yr
+Y_r_bar = F * Yr;
+
+% Find the index k that maximizes the norm of the k-th row of F * Yr
+[~, k_tilde] = max(vecnorm(Y_r_bar, 2, 2));
+
+% Define the function to add artificial delay δ to Yr
+Yr_delayed = @(delta) Yr .* exp(-1j * 2 * pi * Df * delta * (0:length(Yr)-1)).';
+
+% Optimization options for the quasi-Newton method
+options = optimoptions('fminunc', 'Display', 'off', 'OptimalityTolerance', 1e-10);
+
+% Function to be minimized
+objective_function = @(delta) -norm(F(k_tilde, :) * Yr_delayed(delta) * ones(1, Nsym));
+
+% Perform the optimization over δ in the range [0, Delta_t]
+delta_tilde = fminunc(objective_function, 0, options);
+
+% Estimate tau_r
+tau_r = (k_tilde - 1) * Delta_t - delta_tilde;
+
+% Display the results
+disp(['Estimated tau_r: ', num2str(tau_r)]);
+
+% IV.Gam = zeros(N_ftt_tilde^2,obj.config.T); % vector that represents all RIS phase shifts
+%             for tc = 1:size(obj.RisPhaseProfile,2)
+%                 G = ifft2(reshape(obj.RisPhaseProfile(:,tc),obj.config.Mc,obj.config.Mc),obj.config.N_F_tilde,obj.config.N_F_tilde);
+%                 IV.Gam(:,tc) = G(:);
+%             end
+
+
+
+% % OFDM symbol generation
+% data    = 2*randi([0 1],1, Nsym*Nfft)-1; % BPSK data
+% Tx      = zeros(1,Nsym*(Nfft+Ncp));
+% OFDMsym = zeros(1,Nfft);  
+% 
+% for sym = 1:Nsym
+%     OFDMsym                                 = ifft(data(Nfft*(sym-1)+1:(Nfft*sym)),Nfft)*sqrt(Nfft);
+%     Tx((Nfft+Ncp)*(sym-1)+1:(Nfft+Ncp)*sym) = [OFDMsym(Nfft-Ncp+1:Nfft) OFDMsym];
+% end
+% 
+% %AWGN channel
+% noise = sqrt(snr/2)*(randn(1,Nsym*(Nfft+Ncp))+1i*randn(1,Nsym*(Nfft+Ncp)));
+% Rx    = exp(1i*2*pi*FreqOffset*(0:length(Tx)-1)./Nfft).*Tx + noise; 
+
+% %% Compute azimuth and elevation angles
+% rotatedBstoRiSPos = rotMatrix*BsRisVec.';
+% rotatedUetoRiSPos = rotMatrix*RisUeVec.';
+% 
+% % Compute azimuth angle (angle in x-y plane)
+% az = rad2deg(atan2(rotatedBstoRiSPos(2), rotatedBstoRiSPos(1)));
+% 
+% % Compute elevation angle (angle from x-y plane to direction vector)
+% el = rad2deg(acos(rotatedBstoRiSPos(3))); 
+% 
+% % Calculate properties
+% cosAz = cos(az);
+% sinAz = sin(az);
+% cosEl = cos(el);
+% sinEl = sin(el);
+% % Calculate wavenumber vector
+% k = cal_Kv(sinEl, cosAz, sinAz, cosEl, lambda);
+
+
+
